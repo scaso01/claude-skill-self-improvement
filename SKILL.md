@@ -1,7 +1,7 @@
 ---
 name: self-improvement
 description: Analyze conversation history to find friction patterns and suggest CLAUDE.md/skill improvements. Use when user wants to review what went wrong across sessions and systematically improve. (user)
-allowed-tools: Read, Bash, Grep, Glob, Task
+allowed-tools: Read, Write, Bash, Grep, Glob, Task
 ---
 
 # Self-Improvement - Learn from History
@@ -54,7 +54,7 @@ For each friction pattern, classify:
 
 ### Phase 5: Output
 
-Create a markdown file (e.g., `CLAUDE_IMPROVEMENTS.md`) with:
+Create a markdown file at `~/.claude/CLAUDE_IMPROVEMENTS.md` with:
 
 ```markdown
 # Suggested CLAUDE.md Improvements
@@ -96,6 +96,24 @@ Based on analysis of N conversations from [date range].
 ```
 
 **Do not apply changes** - create the file for user review.
+
+### Phase 6: Reset the Harness Counter
+
+After the report file is written, reset the /self-improvement counter so the SessionStart hook stops nudging. Write `~/.claude/hooks/data/self-improvement-state.json` with this exact shape:
+
+```json
+{
+  "session_count": 0,
+  "seen_session_ids": [],
+  "last_improvement_run": "<ISO_8601_TIMESTAMP_NOW>"
+}
+```
+
+- `seen_session_ids` MUST be an empty list. The Stop-hook counter (in `reflect_analyzer.py`) appends to this list to dedup distinct sessions; resetting to `[]` clears the dedup set so the count starts fresh.
+- Do NOT include the legacy `last_session_id` string field — it was replaced on 2026-04-24 because a single string thrashes when multiple Claude Code windows fire Stop hooks concurrently.
+- `<ISO_8601_TIMESTAMP_NOW>` is `datetime.now().isoformat()` (e.g. `2026-04-22T09:51:49`). Do NOT use a UUID — the field must be a timestamp or the reset logic can't parse it.
+
+Use the Write tool to overwrite the file. Only do this step AFTER the report file from Phase 5 is on disk — if Phase 5 was skipped or interrupted, do not write the state file.
 
 ## Usage Examples
 
