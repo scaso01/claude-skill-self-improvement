@@ -1,124 +1,141 @@
 ---
 name: self-improvement
-description: Analyze conversation history to find friction patterns and suggest CLAUDE.md/skill improvements. Use when user wants to review what went wrong across sessions and systematically improve. (user)
-allowed-tools: Read, Write, Bash, Grep, Glob, Task
+description: Analyze accumulated correction signals from the unaudited buffer; propose CLAUDE.md rule additions, reinforcements, and prune candidates. Run when the SessionStart gate fires or when reviewing what went wrong.
+allowed-tools: Read, Write, Bash, Grep, Glob
 ---
 
-# Self-Improvement - Learn from History
+# Self-Improvement - Audit CLAUDE.md Against Accumulated Signals
 
-Analyze Claude Code conversation history to find friction patterns, check what's already fixed, and suggest improvements.
+Reads the pre-computed correction buffer (populated by `reflect_analyzer.py` after every session)
+and classifies signals against current CLAUDE.md rules. No agent dispatch. No multi-MB jsonl reads.
 
-## Instructions
+## Phase 1: Read Unaudited Buffer
 
-### Phase 1: Find Conversations
+Read `~/.claude/hooks/data/self-improvement-state.json`.
 
-```bash
-# Get project directory (encode current path with dashes)
-ls ~/.claude/projects/
+Extract `unaudited_findings` list. If the list is empty, report:
 
-# List today's conversations (or adjust -mtime for longer range)
-ls -lt ~/.claude/projects/<encoded-path>/*.jsonl | head -20
-```
+> "No uncovered signals accumulated. Nothing to audit."
 
-### Phase 2: Parallel Analysis
+Then skip directly to Phase 6 (still reset state so `last_improvement_run` is updated).
 
-Spawn Task agents (subagent_type: general-purpose) to analyze conversations in parallel. Each agent reads one .jsonl file and extracts:
+Each finding has:
+- `snippet` — first 200 chars of the user correction message
+- `signals` — list of regex patterns that matched
+- `session_id` — which session it came from
+- `timestamp` — when it was recorded
 
-1. What was user trying to accomplish?
-2. Problems/friction that occurred (include user quotes showing frustration)
-3. What worked well?
-4. Repeated patterns or inefficiencies
+## Phase 2: Read CLAUDE.md
 
-For large files (>500KB), prioritize those - they contain the meatiest sessions.
+Read `~/.claude/CLAUDE.md` fully.
 
-### Phase 3: Synthesize
+Extract rule keywords:
+- Bold phrases: regex `\*\*(.+?)\*\*` — lowercase each match, split on whitespace, keep tokens >= 5 chars
+- Headings: regex `^#{1,4}\s+(.+)$` (multiline) — same lowercasing/splitting/filtering
 
-After all agents complete, combine findings:
+Build a flat keyword set from all tokens.
 
-- **Top friction patterns** ranked by frequency
-- **What worked well** (don't lose these)
-- **User frustration quotes** (raw evidence)
+## Phase 3: Classify Findings into 3 Buckets
 
-**Generalize aggressively.** Look for the meta-pattern behind specific issues.
+For each finding in `unaudited_findings`:
 
-### Phase 4: Cross-Reference
+**Covered check:** does any keyword from Phase 2 appear as a substring (case-insensitive) in the finding's `snippet`?
 
-Read current documentation:
-- Project CLAUDE.md
-- User ~/.claude/CLAUDE.md
-- Skills in .claude/skills/ and ~/.claude/skills/
+**Frequency check:** across ALL findings in the buffer, how many distinct `session_id` values contributed findings that match the same keyword?
 
-For each friction pattern, classify:
-- **Already fixed** - note location
-- **Still missing** - needs addition
+Buckets:
+1. **Covered & followed** — finding matches a keyword AND that keyword appears in fewer than 2 distinct sessions' findings in the buffer. Rule is working.
+2. **Covered but violated repeatedly** — finding matches a keyword AND that keyword appears in >= 2 distinct sessions' findings. Rule exists but isn't landing.
+3. **Uncovered** — finding matches no keyword. Genuinely new pattern not yet captured in CLAUDE.md.
 
-### Phase 5: Output
+## Phase 4: Write CLAUDE_IMPROVEMENTS.md
 
-Create a markdown file at `~/.claude/CLAUDE_IMPROVEMENTS.md` with:
+Create `~/.claude/CLAUDE_IMPROVEMENTS.md` (overwrite if exists) with this structure:
 
 ```markdown
-# Suggested CLAUDE.md Improvements
+# CLAUDE.md Improvement Suggestions
 
-Based on analysis of N conversations from [date range].
-
-## 1. [Issue Name]
-
-**Problem:** [Description of friction]
-
-**Suggested addition to [location]:**
-
-\```markdown
-[Proposed text]
-\```
+Generated: <ISO8601 timestamp>
+Buffer size: <N> findings across <M> distinct sessions
 
 ---
 
-## Already Fixed
+## Reinforce (rules exist but are being violated)
 
-| Issue | Where |
-|-------|-------|
-| ... | ... |
+For each "covered but violated repeatedly" cluster, group by matched keyword.
 
----
-
-## Potential Skills
-
-| Skill | Purpose |
-|-------|---------|
-| ... | ... |
+### Rule: "<matched keyword>"
+- Violation count: N findings across M sessions
+- Sample quotes:
+  - "snippet 1 (truncated to 120 chars)"
+  - "snippet 2"
+- Recommendation: [reinforce wording / move to Critical Rules / accept as dead]
 
 ---
 
-## Raw Friction Log
+## Add (genuinely new patterns not in CLAUDE.md)
 
-- "user quote 1"
-- "user quote 2"
+For each cluster of "uncovered" findings (group by similar signal patterns):
+
+### Pattern: "<describe the common theme>"
+- Count: N findings
+- Sample quotes:
+  - "snippet 1"
+  - "snippet 2"
+- Proposed rule text:
+  > **[Rule name]** — [one-sentence rule derived from the pattern]
+
+---
+
+## Prune Candidates (rules not violated this period)
+
+List rule keywords from Phase 2 that have ZERO matches anywhere in the buffer.
+These are candidates for removal — but only meaningful if buffer has >= 20 findings.
+If buffer < 20, add a caveat: "Buffer too small to draw conclusions about dead rules."
+
+| Keyword | Last seen in buffer |
+|---------|---------------------|
+| keyword | never               |
+
+---
+
+## Already Working
+
+Keywords that appear in the buffer AND are only in the "covered & followed" bucket.
+These rules are firing correctly — don't change them.
 ```
 
-**Do not apply changes** - create the file for user review.
+**Do NOT apply changes** — write the file for user review only.
 
-### Phase 6: Reset the Harness Counter
+## Phase 5: Confirm Report on Disk
 
-After the report file is written, reset the /self-improvement counter so the SessionStart hook stops nudging. Write `~/.claude/hooks/data/self-improvement-state.json` with this exact shape:
+After writing, read back the first 5 lines of `~/.claude/CLAUDE_IMPROVEMENTS.md` to confirm
+the file is on disk with content. If it is not present or empty, stop here and report the error.
+Do NOT proceed to Phase 6.
+
+## Phase 6: Reset State File
+
+Write `~/.claude/hooks/data/self-improvement-state.json` with this exact shape:
 
 ```json
 {
   "session_count": 0,
   "seen_session_ids": [],
-  "last_improvement_run": "<ISO_8601_TIMESTAMP_NOW>"
+  "last_improvement_run": "<ISO_8601_TIMESTAMP_NOW>",
+  "unaudited_findings": []
 }
 ```
 
-- `seen_session_ids` MUST be an empty list. The Stop-hook counter (in `reflect_analyzer.py`) appends to this list to dedup distinct sessions; resetting to `[]` clears the dedup set so the count starts fresh.
-- Do NOT include the legacy `last_session_id` string field — it was replaced on 2026-04-24 because a single string thrashes when multiple Claude Code windows fire Stop hooks concurrently.
-- `<ISO_8601_TIMESTAMP_NOW>` is `datetime.now().isoformat()` (e.g. `2026-04-22T09:51:49`). Do NOT use a UUID — the field must be a timestamp or the reset logic can't parse it.
+- `unaudited_findings` MUST be reset to `[]`. This clears the buffer so new signals accumulate fresh.
+- `seen_session_ids` MUST be reset to `[]`. The Stop-hook counter deduplicates on this list.
+- `session_count` MUST be reset to `0`.
+- `<ISO_8601_TIMESTAMP_NOW>` is the current datetime in ISO 8601 format (e.g. `2026-04-29T10:15:00.123456`). Do NOT use a UUID — the field must be a timestamp or the auto-reset logic in `reflect_analyzer.py` can't parse it.
 
-Use the Write tool to overwrite the file. Only do this step AFTER the report file from Phase 5 is on disk — if Phase 5 was skipped or interrupted, do not write the state file.
+Use the Write tool to overwrite the file. Only run this step AFTER the Phase 5 confirmation
+that the report is on disk.
 
 ## Usage Examples
 
 ```
 /self-improvement
-/self-improvement last 3 days
-/self-improvement refactoring
 ```
